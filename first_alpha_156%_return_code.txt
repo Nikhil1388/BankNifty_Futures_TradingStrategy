@@ -1,0 +1,282 @@
+import numpy as np
+import pandas as pd
+import talib as ta
+from blueshift.library.technicals.indicators import bollinger_band, ema
+from blueshift.finance import commission, slippage
+from blueshift.api import(symbol,order_target_percent,set_commission,set_slippage,
+                            schedule_function,
+                            date_rules,
+                            time_rules,
+                            square_off,
+                       )
+
+def initialize(context):
+    """
+        A function to define things to do at the start of the strategy
+    """
+    
+    # universe selection
+    context.securities = [symbol("BANKNIFTY-I")]
+
+    # define strategy parameters
+    context.params = {'indicator_lookback':550,
+                      'indicator_freq':'1m',
+                      'buy_signal_threshold':0.2,
+                      'sell_signal_threshold':-0.2,
+                      'trade_freq':5,
+                      'leverage':1}
+    context.stoploss = 0.08
+    # variables to track signals and target portfolio
+    context.signals = dict((security,0) for security in context.securities)
+    context.target_position = dict((security,0) for security in context.securities)
+    context.entry_price = dict((security,0) for security in context.securities)
+    context.entry_side = dict((security,0) for security in context.securities)
+    # set trading cost and slippage to zero
+    set_commission(commission.PerShare(cost=0.00, min_trade_cost=0.00))
+    set_slippage(slippage.FixedSlippage(0.000))
+    
+    freq = int(context.params['trade_freq'])
+    schedule_function(run_strategy, date_rules.every_day(),
+                      time_rules.every_nth_minute(freq))
+    
+    schedule_function(stop_trading, date_rules.every_day(),
+                      time_rules.market_close(minutes=30))
+    
+    context.trade = True
+    
+def before_trading_start(context, data):
+    context.trade = True
+    
+def stop_trading(context, data):
+    context.trade = False
+
+def check_stop_loss(context, data):
+    px = data.current(context.securities,'close')
+    for security in context.securities:
+        #print(1)
+        if context.entry_side[security] == 0:
+            continue
+        loss = px[security]/context.entry_price[security] - 1
+        #print(loss)
+        if (context.entry_side[security] == 1) and (loss < -context.stoploss):
+            # we were long and hit the stoploss
+            order_target_percent(security, 0)
+            # reset data
+            context.entry_price[security] = 0
+            context.entry_side[security] = 0
+            context.target_position[security] = 0
+            return True
+        elif (context.entry_side[security] == -1) and (loss > context.stoploss):
+            # we were short and hit the stoploss
+            order_target_percent(security, 0)
+            # reset data
+            context.entry_price[security] = 0
+            context.entry_side[security] = 0
+            context.target_position[security] = 0
+            return True
+
+    return False
+
+def calculate_entry_price(context, data):
+    # update only if there is a change, i.e. a new entry or exit or a flip
+    # in position for the asset. Also reset for exits
+    px = data.current(context.securities,'close')
+
+    for security in context.securities:
+        if (context.entry_price[security] == 0) and (context.target_position[security] !=0):
+            # we entered a fresh position
+            context.entry_price[security] = px[security]
+            context.entry_side[security] = np.sign(context.target_position[security])
+        elif (context.entry_price[security] != 0) and (context.target_position[security] == 0):
+            # reset for exits
+            context.entry_price[security] = 0
+            context.entry_side[security] = 0
+        elif (np.sign(context.target_position[security]) !=0) and (context.entry_side[security]):
+            # we flipped an existing position
+            context.entry_price[security] = px[security]
+            context.entry_side[security] = np.sign(context.target_position[security])
+
+def run_strategy(context, data):
+    """
+        A function to define core strategy steps
+    """
+    if not context.trade:
+        return
+    if check_stop_loss(context, data):
+        # print('{} got stopped out'.format(get_datetime()))
+        return
+    
+    generate_signals(context, data)
+    generate_target_position(context, data)
+    rebalance(context, data)
+    calculate_entry_price(context, data)
+
+def rebalance(context,data):
+    """
+        A function to rebalance - all execution logic goes here
+    """
+    for security in context.securities:
+        c=weight(context,data)
+        # sltp = SLTP(context,data)
+        order_target_percent(security, context.target_position[security]*c)
+
+def generate_target_position(context, data):
+    """
+        A function to define target portfolio
+    """
+    num_secs = len(context.securities)
+    weight = round(1.0/num_secs,2)*context.params['leverage']
+
+    for security in context.securities:
+        if context.signals[security] > context.params['buy_signal_threshold']:
+            context.target_position[security] = weight
+        elif context.signals[security] < context.params['sell_signal_threshold']:
+            context.target_position[security] = -weight
+        else:
+            context.target_position[security] = 0
+
+
+def generate_signals(context, data):
+    """
+        A function to define define the signal generation
+    """
+    try:
+        price_data = data.history(context.securities, 'close',
+            context.params['indicator_lookback'],
+            context.params['indicator_freq'])
+    except:
+        return
+
+    for security in context.securities:
+        px = price_data.loc[:,security].values
+        context.signals[security] = signal_function(context,px, data, context.params)
+    
+
+
+def min_max_scaling(series):
+    return (series - series.min()) / (series.max() - series.min())
+
+def risk(x,a,b,c,d,e,f,g):
+    if x<e:
+        return a
+    elif x<f:
+        return b
+    elif x<g:
+        return c
+    else:
+        return d
+
+
+def weight(context,data):    
+    # square_off(assets=context.securities[0], algo=True)
+    df1 = data.history(context.securities[0], ["open","high","low","close","volume"], 600, "1m")
+    df=df1
+    df["atr"]= ta.ATR(df.high, df.low, df.close, timeperiod=14)
+    q1=df.atr.describe()["25%"]
+    q2=df.atr.describe()["50%"]
+    q3=df.atr.describe()["75%"]
+    wght=risk(df.iloc[-1]["atr"],1.0, 0.8, 0.8999999999999999, 0.6,q1,q2,q3)
+    return wght
+
+def SLTP(context,data):
+    df1 = data.history(context.securities[0], ["open","high","low","close","volume"], 600, "1m")
+    df=df1
+    df["atr"]= ta.ATR(df.high, df.low, df.close, timeperiod=14)
+    sig_SLTP = generate_signals(context, data)
+    stop_loss_price = 0
+    for security in context.securities:
+        if context.signals[security]>0:
+            stop_loss_price = df.close.iloc[-1] -2*df.atr.iloc[-1]
+        elif context.signals[security]<0:
+            stop_loss_price = df.close.iloc[-1] + 2*df.atr.iloc[-1]
+    return stop_loss_price
+            
+
+
+    
+
+
+
+def signal_function(context,px,data, params):
+    
+    
+    # square_off(assets=context.securities[0], algo=True)
+
+    def func(time_series):
+            time_series=time_series.values
+            return np.polyfit(np.log( range(2, 15)),np.log([np.std(np.subtract(time_series[lag:], time_series[:-lag])) for lag in range(2, 15)]),1)[0]
+
+
+    df1 = data.history(context.securities[0], ["open","high","low","close","volume"], 600, "1m")
+    df=df1
+ 
+
+    tag = "new"
+    def min_max_scaling(series):
+        return (series - series.min()) / (series.max() - series.min())
+
+
+    hurst=func(df['close'][-30:])
+    # return 1
+    if hurst<0.5:
+        df["new"]=df["close"]-df["open"]
+        col_mean = df[tag].rolling(window=40).mean()
+        col_std = df[tag].rolling(window=40).std()
+        df["zscore"] = (df[tag] - col_mean)/col_std
+        df["slowdown"] = df["zscore"].rolling(3).mean()
+        # df["slowdown"]=df["slowdown"].fillna(0)
+        a=-df.iloc[-1]['slowdown']
+        return a
+
+    elif hurst>0.5:
+        df = df.iloc[-100:]
+
+
+        df['f1']=(df['close']-df['open']).rolling(5).mean()
+        df['f2']=(df['high']-df['low']).rolling(5).mean()
+        df["OBV"] = (np.sign(df["close"].diff()) * df["volume"]).fillna(0).cumsum()
+
+        df["new"]=df["close"]-df["open"]
+        col_mean = df["new"].rolling(window=40).mean()
+        col_std = df["new"].rolling(window=40).std()
+        df["zscore"] = (df[tag] - col_mean)/col_std
+        df["f3"] = df["zscore"].rolling(3).mean()        
+
+        val=0
+        sign=np.sign(df['close']-df['close'].shift(-1))
+        df=df-df.shift(1)
+        df.dropna(inplace=True)
+        df=min_max_scaling(df)
+        df['sign']=sign
+
+        def euclidean_distance(row1, row2):
+            distance = 0.0
+            for i in range(len(row1)-1):
+                distance += (row1[i] - row2[i])**2
+            return (distance)**0.5
+        def get_neighbors(train, test_row, num_neighbors):
+            distances = list()
+            for i,train_row in enumerate(train):
+                dist = euclidean_distance(test_row, train_row)
+                distances.append((train_row, dist, i))
+            distances.sort(key=lambda tup: tup[1])
+            neighbors = list()
+            for i in range(num_neighbors):
+                neighbors.append(distances[i][-1])
+            return neighbors
+
+        for n_num in range(2,9):
+            clmns=['f1','f2','f3','close','OBV']
+            # clmns=['open','high','low','close','volume']
+            # clmns=['open','high','low','close','OBV']
+            idxs=get_neighbors(np.array(df[ clmns ].iloc[:-1]),np.array(df[clmns].iloc[-1]),n_num)
+            val+=sum(df.iloc[idxs]['sign'])/n_num
+        return (np.sign(val))
+    else:
+        return 0
+    # signals=[]
+    # clmns=['open','high','low','close','volume']
+    # for i in range(300,len(df)):
+    #     signals.append(signal(df[i-300:i][clmns]))
+    #     if i%1000==0:
+    #         print(i)
